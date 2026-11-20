@@ -1,0 +1,24 @@
+{
+    "name": "example/weather-collector",
+    "description": "Daily collector for Open-Meteo and WeatherAPI forecasts (hourly + daily temperature and precipitation) with a JSON API.",
+    "type": "project",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.2",
+        "ext-curl": "*",
+        "ext-json": "*",
+        "ext-pdo": "*",
+        "ext-pdo_pgsql": "*"
+    },
+    "suggest": {
+        "ext-pcntl": "Graceful shutdown of the scheduler on SIGTERM"
+    },
+    "autoload": {
+        "psr-4": {
+            "WeatherCollector\\": "src/"
+        }
+    },
+    "scripts": {
+        "test": "php tests/run.php"
+    }
+}

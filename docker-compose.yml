@@ -1,0 +1,77 @@
+x-app: &app
+  build: .
+  image: weather-collector:latest
+  environment: &app-env
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    DB_HOST: db
+    DB_PORT: 5432
+    DB_NAME: ${DB_NAME:-weather}
+    DB_USER: ${DB_USER:-weather}
+    DB_PASSWORD: ${DB_PASSWORD:-weather}
+    LOCATIONS_FILE: ${LOCATIONS_FILE:-config/locations.json}
+    PROVIDERS: ${PROVIDERS:-open_meteo,weatherapi}
+    WEATHERAPI_KEY: ${WEATHERAPI_KEY:-}
+    FETCH_TIME: ${FETCH_TIME:-06:00}
+    RETRY_INTERVAL_MINUTES: ${RETRY_INTERVAL_MINUTES:-30}
+    MAX_ATTEMPTS_PER_DAY: ${MAX_ATTEMPTS_PER_DAY:-4}
+    HTTP_TIMEOUT_SECONDS: ${HTTP_TIMEOUT_SECONDS:-15}
+    HTTP_MAX_RETRIES: ${HTTP_MAX_RETRIES:-2}
+    STORE_RAW_PAYLOAD: ${STORE_RAW_PAYLOAD:-true}
+    API_TOKEN: ${API_TOKEN:-}
+  volumes:
+    - ./config:/app/config:ro   # edit locations without rebuilding
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-weather}
+      POSTGRES_USER: ${DB_USER:-weather}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-weather}
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    ports: ["127.0.0.1:5432:5432"]
+
+  # One-shot: applies migrations and syncs locations, then exits.
+  migrate:
+    <<: *app
+    command: ["php", "bin/console", "migrate"]
+    restart: "no"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Long-running daily collector.
+  scheduler:
+    <<: *app
+    command: ["php", "bin/console", "schedule"]
+    user: www-data
+    restart: unless-stopped
+    stop_grace_period: 60s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # Read-only JSON API.
+  api:
+    <<: *app
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8080}:80"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "php", "-r", "exit(@file_get_contents('http://localhost/health') === false ? 1 : 0);"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  db-data:

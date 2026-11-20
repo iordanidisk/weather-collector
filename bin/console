@@ -1,0 +1,117 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use WeatherCollector\App;
+use WeatherCollector\Repository\LocationRepository;
+use WeatherCollector\Service\SchedulePolicy;
+
+require dirname(__DIR__) . '/src/bootstrap.php';
+
+const USAGE = <<<'TXT'
+Usage: bin/console <command> [options]
+
+Commands:
+  migrate                 Apply database migrations and sync locations from the config file
+  locations:sync          Sync locations from LOCATIONS_FILE into the database
+  fetch                   Fetch today's forecast now (skips pairs already collected today)
+      --force             Re-fetch even if today's data exists (overwrites it)
+      --provider=CODE     Only this provider (open_meteo, weatherapi)
+      --location=SLUG     Only this location
+  schedule                Run the daily scheduler in the foreground (used by the scheduler container)
+  status                  Show the latest run per provider/location
+
+TXT;
+
+$args = array_slice($argv, 1);
+$command = $args[0] ?? 'help';
+$options = [];
+foreach (array_slice($args, 1) as $arg) {
+    if (preg_match('/^--([a-z-]+)(?:=(.*))?$/', $arg, $m)) {
+        $options[$m[1]] = $m[2] ?? true;
+    } else {
+        fwrite(STDERR, "Unknown argument: $arg\n");
+        exit(2);
+    }
+}
+
+$app = App::fromEnvironment();
+
+try {
+    switch ($command) {
+        case 'migrate':
+            $applied = $app->migrator()->migrate();
+            echo $applied === [] ? "Database schema is up to date.\n" : 'Applied: ' . implode(', ', $applied) . "\n";
+            // no break – migrate also syncs locations
+        case 'locations:sync':
+            $configured = LocationRepository::loadConfigFile($app->locationsFile());
+            $app->locations()->sync($configured);
+            echo 'Locations synced: ' . implode(', ', array_map(static fn ($l) => $l->slug, $configured)) . "\n";
+            exit(0);
+
+        case 'fetch':
+            $providers = $app->providers();
+            if (is_string($options['provider'] ?? null)) {
+                $providers = array_intersect_key($providers, [$options['provider'] => true])
+                    ?: throw new InvalidArgumentException('Unknown or disabled provider: ' . $options['provider']);
+            }
+            $locations = $app->locations()->active();
+            if (is_string($options['location'] ?? null)) {
+                $locations = array_values(array_filter($locations, static fn ($l) => $l->slug === $options['location']))
+                    ?: throw new InvalidArgumentException('Unknown or inactive location: ' . $options['location']);
+            }
+
+            $now = new DateTimeImmutable('now');
+            $failed = 0;
+            foreach ($locations as $location) {
+                $date = SchedulePolicy::forecastDate($location, $now);
+                foreach ($providers as $provider) {
+                    $label = sprintf('%-11s %-16s', $provider->code(), $location->slug);
+                    if (!$provider->isConfigured()) {
+                        echo "$label skipped (not configured)\n";
+                        continue;
+                    }
+                    if (!isset($options['force']) && $app->runs()->dayState($provider->code(), (int) $location->id, $date)['succeeded']) {
+                        echo "$label skipped (already collected for $date, use --force to replace)\n";
+                        continue;
+                    }
+                    $outcome = $app->collector()->collect($provider, $location, $now);
+                    $failed += $outcome === 'failed' ? 1 : 0;
+                    echo "$label $outcome ($date)\n";
+                }
+            }
+            exit($failed > 0 ? 1 : 0);
+
+        case 'schedule':
+            $app->scheduler()->run();
+            exit(0);
+
+        case 'status':
+            $rows = $app->runs()->latestPerPair();
+            if ($rows === []) {
+                echo "No runs yet.\n";
+            }
+            foreach ($rows as $row) {
+                printf(
+                    "%-11s %-16s last run %s (for %s) %s | last successful day: %s\n",
+                    $row['provider'], $row['location'], $row['started_at'], $row['forecast_date'],
+                    strtoupper($row['status']) . ($row['status'] === 'failed' ? ': ' . $row['error_message'] : ''),
+                    $row['last_success_date'] ?? 'never',
+                );
+            }
+            exit(0);
+
+        case 'help':
+        case '--help':
+            echo USAGE;
+            exit(0);
+
+        default:
+            fwrite(STDERR, "Unknown command: $command\n\n" . USAGE);
+            exit(2);
+    }
+} catch (Throwable $e) {
+    $app->logger()->error('Command failed', ['command' => $command, 'error' => $e->getMessage(), 'exception' => get_class($e)]);
+    exit(1);
+}
